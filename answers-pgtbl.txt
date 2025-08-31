@@ -1,0 +1,26 @@
+1. Speed up system calls
+- 分配内存：allocproc()
+- 建立映射：proc_pagetable() + mappages()
+- 权限：只读 + 用户可访问
+- 加速原因：用户态直接读共享页，无需陷入内核
+- 其他可优化的系统调用：getuid(), getgid(), time()
+
+2. Print a page table (vmprint)
+- 遍历页表层级，递归打印有效 PTE
+- 格式：缩进表示深度，显示 PTE 值和物理地址
+- 第0页：top-level 页表
+- 第1页：用户栈映射
+- 第2页：用户代码段映射
+- 用户态访问权限解释
+- 第倒数第三页内容说明
+
+3. Detecting accessed pages (pgaccess)
+- 参数：起始地址、页数、用户缓冲区
+- 遍历 PTE 检查 PTE_A 位
+- 填充 bitmask，清除访问位
+- 返回用户缓冲区
+
+4. Optional challenge
+- super-pages: 减少 PTE 数量，加快访问
+- 解除映射第一页: 空指针访问触发页错误
+- 新系统调用报告 dirty pages: 检查 PTE_D 位
