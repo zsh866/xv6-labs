@@ -287,6 +287,14 @@ intr_get()
   return (x & SSTATUS_SIE) != 0;
 }
 
+
+static inline uint64
+r_fp()
+{
+  uint64 x;
+  asm volatile("mv %0, s0" : "=r" (x) );
+  return x;
+}
 static inline uint64
 r_sp()
 {
@@ -295,7 +303,7 @@ r_sp()
   return x;
 }
 
-// read and write tp, the thread pointer, which xv6 uses to hold
+// read and write tp, the thread pointer, which xv6 uses to holdS
 // this core's hartid (core number), the index into cpus[].
 static inline uint64
 r_tp()
