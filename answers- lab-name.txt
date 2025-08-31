@@ -1,0 +1,17 @@
+Q: 为什么双线程会导致 key 丢失，而单线程不会？
+A: 因为 put() 和 insert() 没有加锁，两个线程可能同时在同一个 bucket 上操作，导致 race condition。单线程不存在这种并发冲突。
+
+Q: 请写出一个可能导致丢失的事件序列。
+A:
+1. Thread A: put(k1)，bucket[i] 为空，准备写入
+2. Thread B: put(k2)，bucket[i] 为空，准备写入
+3. Thread A: 写入 k1
+4. Thread B: 写入 k2，覆盖了 A 的写入
+→ 结果：k1 丢失
+
+Q: 如何修复？
+A: 在 put() 和 get() 中使用 pthread_mutex_lock/unlock 来保证互斥。每次操作必须持有锁，避免并发写入。
+
+Q: 结果如何？
+A: 加锁后，ph_safe 测试通过（丢失 key = 0）。  
+进一步优化为 bucket-level locks 时，ph_fast 也通过，实现了并行加速。
