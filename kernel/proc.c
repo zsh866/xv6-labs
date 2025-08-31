@@ -5,7 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
-
+#include "fcntl.h"
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -145,7 +145,8 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+  // 初始化 VMA 数组
+  memset(p->vma, 0, sizeof(p->vma));
   return p;
 }
 
@@ -283,6 +284,53 @@ fork(void)
   struct proc *np;
   struct proc *p = myproc();
 
+  if((np = allocproc()) == 0) return -1;
+
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+  np->sz = p->sz;
+  *(np->trapframe) = *(p->trapframe);
+  np->trapframe->a0 = 0;
+
+  // 文件引用计数
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  // 复制 VMA
+  for(i = 0; i < NVMA; i++){
+    if(p->vma[i].used){
+      memmove(&np->vma[i], &p->vma[i], sizeof(struct vm_area));
+      filedup(p->vma[i].vfile);
+    }
+  }
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+  pid = np->pid;
+
+  release(&np->lock);
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
+
+/* int
+fork(void)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
   // Allocate process.
   if((np = allocproc()) == 0){
     return -1;
@@ -303,10 +351,23 @@ fork(void)
   np->trapframe->a0 = 0;
 
   // increment reference counts on open file descriptors.
-  for(i = 0; i < NOFILE; i++)
-    if(p->ofile[i])
-      np->ofile[i] = filedup(p->ofile[i]);
+  for(int i = 0; i < NVMA; ++i){
+    if(p->vma[i].used){
+      memmove(&np->vma[i], &p->vma[i], sizeof(p->vma[i]));
+      filedup(p->vma[i].vfile); // 增加引用计数
+    }
+}
   np->cwd = idup(p->cwd);
+
+#ifdef LAB_MMAP
+  // 复制父进程的 VMA
+  for(i = 0; i < NVMA; i++) {
+    if(p->vma[i].used) {
+      memmove(&np->vma[i], &p->vma[i], sizeof(p->vma[i]));
+      filedup(p->vma[i].vfile);  // 增加文件引用计数
+    }
+  }
+#endif
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -324,6 +385,7 @@ fork(void)
 
   return pid;
 }
+ */
 
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
@@ -351,6 +413,53 @@ exit(int status)
   if(p == initproc)
     panic("init exiting");
 
+  // 关闭文件
+  for(int fd = 0; fd < NOFILE; fd++){
+    if(p->ofile[fd]){
+      fileclose(p->ofile[fd]);
+      p->ofile[fd] = 0;
+    }
+  }
+
+  // 取消 VMA 映射
+  for(int i = 0; i < NVMA; i++){
+    if(p->vma[i].used){
+      uint64 a = PGROUNDDOWN(p->vma[i].addr);
+      int npages = (PGROUNDUP(p->vma[i].addr + p->vma[i].len) - a) / PGSIZE;
+      if(p->vma[i].flags == MAP_SHARED && (p->vma[i].prot & PROT_WRITE))
+        filewrite(p->vma[i].vfile, a, p->vma[i].len);
+      fileclose(p->vma[i].vfile);
+      uvmunmap(p->pagetable, a, npages, 1);
+      p->vma[i].used = 0;
+    }
+  }
+
+  begin_op();
+  iput(p->cwd);
+  end_op();
+  p->cwd = 0;
+
+  acquire(&wait_lock);
+  reparent(p);
+  wakeup(p->parent);
+  
+  acquire(&p->lock);
+  p->xstate = status;
+  p->state = ZOMBIE;
+  release(&wait_lock);
+
+  sched();
+  panic("zombie exit");
+}
+
+/* void
+exit(int status)
+{
+  struct proc *p = myproc();
+
+  if(p == initproc)
+    panic("init exiting");
+
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
@@ -359,6 +468,24 @@ exit(int status)
       p->ofile[fd] = 0;
     }
   }
+
+#ifdef LAB_MMAP
+  // 将进程的已映射区域取消映射（就像调用 munmap）
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vma[i].used) {
+      // 如果是 MAP_SHARED + 可写，则写回文件
+      if((p->vma[i].flags == MAP_SHARED) && (p->vma[i].prot & PROT_WRITE)) {
+        filewrite(p->vma[i].vfile, p->vma[i].addr, p->vma[i].len);
+      }
+      // 解除映射
+      uvmunmap(p->pagetable, p->vma[i].addr, p->vma[i].len / PGSIZE, 1);
+      // 关闭文件
+      fileclose(p->vma[i].vfile);
+      // 清空 VMA
+      p->vma[i].used = 0;
+    }
+  }
+#endif
 
   begin_op();
   iput(p->cwd);
@@ -383,7 +510,8 @@ exit(int status)
   // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");
-}
+} */
+
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.

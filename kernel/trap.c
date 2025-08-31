@@ -2,9 +2,15 @@
 #include "param.h"
 #include "memlayout.h"
 #include "riscv.h"
-#include "spinlock.h"
-#include "proc.h"
 #include "defs.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
+#include "proc.h"
+
+
 
 struct spinlock tickslock;
 uint ticks;
@@ -33,7 +39,134 @@ trapinithart(void)
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
 //
+static int mmap_handler(uint64 va, uint64 scause);
+
 void
+usertrap(void)
+{
+  int which_dev = 0;
+  struct proc *p = myproc();
+
+  if((r_sstatus() & SSTATUS_SPP) != 0)
+    panic("usertrap: not from user mode");
+
+  // send interrupts and exceptions to kerneltrap(), not usertrap()
+  w_stvec((uint64)kernelvec);
+
+  // save user program counter.
+  p->trapframe->epc = r_sepc();
+
+  uint64 scause = r_scause();
+
+  if(scause == 8){
+    // system call
+    if(p->killed)
+      exit(-1);
+    p->trapframe->epc += 4;
+    intr_on();
+    syscall();
+  } else if((which_dev = devintr()) != 0){
+    // ok
+  } else if(scause == 13 || scause == 15){ // load/store page fault
+#ifdef LAB_MMAP
+    uint64 fault_va = r_stval();
+
+    // 只允许在用户地址空间有效范围内（避免越界到内核/无效区域）
+    // 也常见做法是确保在 [stack, p->sz) 之间；你可按实验手册约束。
+    if (fault_va < p->sz && fault_va >= p->trapframe->sp){
+      if(mmap_handler(fault_va, scause) != 0)
+        p->killed = 1;
+    } else {
+      p->killed = 1;
+    }
+#else
+    p->killed = 1;
+#endif
+  } else {
+    printf("usertrap(): unexpected scause %p pid=%d\n", scause, p->pid);
+    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+    p->killed = 1;
+  }
+
+  if(p->killed)
+    exit(-1);
+
+  // give up the CPU if this is a timer interrupt.
+  if(which_dev == 2)
+    yield();
+
+  usertrapret();
+}
+
+// 处理 mmap 的缺页：分配物理页、从文件读入并映射。
+static int
+mmap_handler(uint64 va, uint64 scause)
+{
+  struct proc *p = myproc();
+
+  // 找到包含此 VA 的 VMA
+  int idx = -1;
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].used) {
+      uint64 start = p->vma[i].addr;
+      uint64 end   = start + p->vma[i].len; // 半开区间 [start, end)
+      if (va >= start && va < end) {
+        idx = i;
+        break;
+      }
+    }
+  }
+  if (idx < 0)
+    return -1;
+
+  struct vm_area *vma = &p->vma[idx];
+  struct file *f = vma->vfile;
+
+  // 访问权限基本检查（简化版）
+  if (scause == 13 && f->readable == 0)   return -1; // load fault但文件不可读
+  if (scause == 15 && ( (vma->prot & PROT_WRITE) == 0 || f->writable == 0))
+    return -1; // store fault但VMA不写或文件不可写（MAP_SHARED 时尤为关键）
+
+  // 目标页对齐
+  uint64 va0 = PGROUNDDOWN(va);
+
+  // 分配物理页
+  void *pa = kalloc();
+  if (pa == 0)
+    return -1;
+  memset(pa, 0, PGSIZE);
+
+  // 计算从文件读取的偏移：VMA起点对应文件 offset，VA 的页内偏移按 (va0 - vma->addr)
+  int file_off = vma->offset + (int)(va0 - vma->addr);
+
+  // 从文件读入至物理页
+  ilock(f->ip);
+  int n = readi(f->ip, 0, (uint64)pa, file_off, PGSIZE);
+  iunlock(f->ip);
+
+  // readi 可能返回 < PGSIZE（到达文件尾），0 也算“读不到内容”，但通常允许；
+  // 规范做法是：保留其余为 0（我们已 memset 过），仅当需要严格拒绝时返回 -1。
+  // 这里按实验常规：n 可以是 0..PGSIZE 都接受。
+  if (n < 0) {
+    kfree(pa);
+    return -1;
+  }
+
+  // 组装 PTE 权限
+  int pte_flags = PTE_U;
+  if (vma->prot & PROT_READ)  pte_flags |= PTE_R;
+  if (vma->prot & PROT_WRITE) pte_flags |= PTE_W;
+  if (vma->prot & PROT_EXEC)  pte_flags |= PTE_X;
+
+  // 建立映射
+  if (mappages(p->pagetable, va0, PGSIZE, (uint64)pa, pte_flags) != 0) {
+    kfree(pa);
+    return -1;
+  }
+
+  return 0;
+}
+/* void
 usertrap(void)
 {
   int which_dev = 0;
@@ -82,7 +215,7 @@ usertrap(void)
 
   usertrapret();
 }
-
+ */
 //
 // return to user space
 //

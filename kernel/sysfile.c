@@ -503,3 +503,243 @@ sys_pipe(void)
   }
   return 0;
 }
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  int length, prot, flags, vfd, offset;
+  struct file *vfile;
+  struct proc *p = myproc();
+  uint64 err = 0xffffffffffffffff;
+
+  // 获取参数
+  argaddr(0, &addr);
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argfd(4, &vfd, &vfile);
+  argint(5, &offset);
+
+  // 简化条件：只允许 addr=0, offset=0
+  if(addr != 0 || offset != 0 || length <= 0)
+    return err;
+
+  // 检查权限
+  if(vfile->writable == 0 && (prot & PROT_WRITE) && flags == MAP_SHARED)
+    return err;
+
+  if(p->sz + length > MAXVA)
+    return err;
+
+  // 找到未使用的 VMA
+  for(int i = 0; i < NVMA; i++){
+    if(p->vma[i].used == 0){
+      p->vma[i].used = 1;
+      p->vma[i].addr = p->sz;
+      p->vma[i].len  = length;
+      p->vma[i].prot = prot;
+      p->vma[i].flags= flags;
+      p->vma[i].vfile= vfile;
+      p->vma[i].vfd  = vfd;
+      p->vma[i].offset = offset;
+
+      // 增加文件引用计数
+      filedup(vfile);
+
+      p->sz += length;
+      return p->vma[i].addr;
+    }
+  }
+
+  return err;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+  struct proc *p = myproc();
+  struct vm_area *v = 0;
+
+  argaddr(0, &addr);
+  argint(1, &length);
+  if(length <= 0) return -1;
+
+  uint64 a = PGROUNDDOWN(addr);
+  int npages = (PGROUNDUP(addr + length) - a) / PGSIZE;
+
+  // 查找包含 addr 的 VMA
+  for(int i = 0; i < NVMA; i++){
+    if(p->vma[i].used && a >= p->vma[i].addr && a + length <= p->vma[i].addr + p->vma[i].len){
+      v = &p->vma[i];
+      break;
+    }
+  }
+  if(v == 0) return -1;
+
+  // MAP_SHARED 写回
+  if(v->flags == MAP_SHARED && (v->prot & PROT_WRITE))
+    filewrite(v->vfile, a, length);
+
+  // 取消映射
+  uvmunmap(p->pagetable, a, npages, 1);
+
+  // 更新 VMA
+  if(a == v->addr){
+    v->addr += length;
+    v->len  -= length;
+  } else if(a + length == v->addr + v->len){
+    v->len  -= length;
+  }
+
+  if(v->len == 0){
+    fileclose(v->vfile);
+    v->used = 0;
+  }
+
+  return 0;
+}
+/* uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  int length, prot, flags, vfd, offset;
+  struct file *vfile;
+  uint64 err = 0xffffffffffffffff;
+  struct proc *p = myproc();
+
+  // 直接调用，不检查返回值
+  argaddr(0, &addr);
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argfd(4, &vfd, &vfile);
+  argint(5, &offset);
+
+  // 简化实验假设
+  if(addr != 0 || offset != 0 || length <= 0)
+    return err;
+
+  if(vfile->writable == 0 && (prot & PROT_WRITE) != 0 && flags == MAP_SHARED)
+    return err;
+
+  if(p->sz + length > MAXVA)
+    return err;
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vma[i].used == 0){
+      p->vma[i].used = 1;
+      p->vma[i].addr = p->sz;
+      p->vma[i].len  = length;
+      p->vma[i].prot = prot;
+      p->vma[i].flags= flags;
+      p->vma[i].vfile= vfile;
+      p->vma[i].vfd  = vfd;
+      p->vma[i].offset = offset;
+      filedup(vfile);
+      p->sz += length;
+      return p->vma[i].addr;
+    }
+  }
+
+  return err;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int length;
+  struct proc *p = myproc();
+  struct vm_area *v = 0;
+
+  if(argaddr(0, &addr) < 0) return -1;
+  if(argint(1, &length) < 0) return -1;
+  if(length <= 0) return -1;
+
+  // 对齐
+  uint64 a = PGROUNDDOWN(addr);
+  int npages = (PGROUNDUP(addr + length) - a) / PGSIZE;
+
+  // 查找包含 addr 的 VMA
+  for(int i = 0; i < NVMA; i++){
+    if(p->vma[i].used && a >= p->vma[i].addr && a + length <= p->vma[i].addr + p->vma[i].len){
+      v = &p->vma[i];
+      break;
+    }
+  }
+  if(v == 0) return -1;
+
+  // MAP_SHARED 写回
+  if(v->flags == MAP_SHARED && (v->prot & PROT_WRITE))
+    filewrite(v->vfile, a, length);
+
+  // 取消映射
+  uvmunmap(p->pagetable, a, npages, 1);
+
+  // 更新 VMA
+  if(a == v->addr){
+    v->addr += length;
+    v->len  -= length;
+  } else if(a + length == v->addr + v->len){
+    v->len  -= length;
+  }
+
+  if(v->len == 0){
+    fileclose(v->vfile);
+    v->used = 0;
+  }
+
+  return 0;
+} */
+
+/* uint64 sys_munmap(void) {
+  uint64 addr;
+  int length;
+  struct proc *p = myproc();
+  struct vm_area *v = 0;
+
+  argaddr(0, &addr);   // 直接调用，不返回值
+  argint(1, &length);
+
+  if(length <= 0)
+    return -1;
+
+  // 对齐地址
+  uint64 a = PGROUNDDOWN(addr);
+  int npages = (PGROUNDUP(addr + length) - a) / PGSIZE;
+
+  // 查找包含 addr 的 VMA
+  for(int i = 0; i < NVMA; i++){
+    if(p->vma[i].used && a >= p->vma[i].addr && a + length <= p->vma[i].addr + p->vma[i].len){
+      v = &p->vma[i];
+      break;
+    }
+  }
+  if(v == 0) return -1;
+
+  // MAP_SHARED 写回
+  if(v->flags == MAP_SHARED && (v->prot & PROT_WRITE))
+    filewrite(v->vfile, a, length);
+
+  // 取消映射
+  uvmunmap(p->pagetable, a, npages, 1);
+
+  // 更新 VMA
+  if(a == v->addr){
+    v->addr += length;
+    v->len -= length;
+  } else if(a + length == v->addr + v->len){
+    v->len -= length;
+  }
+
+  if(v->len == 0){
+    fileclose(v->vfile);
+    v->used = 0;
+  }
+
+  return 0;
+}
+
+ */
